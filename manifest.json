@@ -1,0 +1,14 @@
+{
+  "name": "Hall of Fame Enhancers Analysis",
+  "description": "Interactive genomic data visualization platform for analyzing enhancer accessibility profiles",
+  "version": "1.0.0",
+  "entry_point": "app.py",
+  "runtime": "python-3.11",
+  "dependencies": {
+    "streamlit": ">=1.24.0",
+    "pandas": ">=1.5.0",
+    "numpy": ">=1.24.0",
+    "plotly": ">=5.15.0",
+    "pyarrow": ">=12.0.0"
+  }
+}
