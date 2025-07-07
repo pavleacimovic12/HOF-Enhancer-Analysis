@@ -1,151 +1,92 @@
-"""
-Hall of Fame Enhancers Analysis - GitHub Version for Posit Cloud
-Interactive genomic data visualization platform for analyzing enhancer accessibility profiles
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-# Import the chunked data processor for GitHub deployment
-try:
-    from data_processor_chunked import DataProcessor
-except ImportError:
-    from data_processor import DataProcessor
+import pyarrow.feather as feather
+from data_processor_chunked import DataProcessor
 from visualization import VisualizationGenerator
 import os
 
-# Configure Streamlit page
+# Configure page
 st.set_page_config(
-    page_title="Cheat Sheet for Enhancer Analysis",
+    page_title="Hall of Fame Enhancers Analysis",
     page_icon="🧬",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS for genomic theme
-st.markdown("""
-<style>
-    .stApp {
-        background-color: #f8f9fa;
-    }
-    .main-header {
-        background: linear-gradient(90deg, #2E86AB, #A23B72);
-        color: white;
-        padding: 1rem;
-        border-radius: 10px;
-        margin-bottom: 2rem;
-    }
-    .filter-section {
-        background: white;
-        padding: 1rem;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        margin-bottom: 1rem;
-    }
-    .stSelectbox > div > div {
-        background-color: white;
-    }
-    .enhancer-card {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        margin-bottom: 1rem;
-    }
-    .accessibility-plot {
-        border: 2px solid #e1e5e9;
-        border-radius: 8px;
-        padding: 1rem;
-        background: white;
-    }
-    .sidebar .sidebar-content {
-        background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Use the DataProcessor from data_processor_chunked.py directly
-# It already handles chunked CSV files and looks in current directory
-
-# Initialize processor and visualization
-@st.cache_resource
+# Initialize data processor
+@st.cache_data
 def load_data():
     """Load and process all data files"""
     processor = DataProcessor()
-    
-    # Check if CSV chunk files exist in current directory
-    csv_chunks = [f for f in os.listdir(".") if f.startswith("part") and f.endswith(".csv")]
-    if not csv_chunks:
-        st.error("CSV data files not found. Please ensure all part*.csv files are uploaded to the repository.")
-        st.info("Expected files: part1*chunk*.csv, part2*chunk*.csv, part3*chunk*.csv, part4*chunk*.csv")
-        return None, None, None
-    
-    # Check if metadata file exists
-    metadata_file = "Enhancer_and_experiment_metadata_1751579195077.feather"
-    if not os.path.exists(metadata_file):
-        st.error(f"Metadata file not found: {metadata_file}")
-        st.info("Please ensure the metadata feather file is uploaded to the repository")
-        return None, None, None
-    
-    try:
-        peak_data, hof_enhancers, enhancer_metadata = processor.load_all_data()
-        return peak_data, hof_enhancers, enhancer_metadata
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-        return None, None, None
+    return processor.load_all_data()
 
+# Load data
+try:
+    peak_data, hof_enhancers, enhancer_metadata = load_data()
+    st.success("App is loaded!")
+except Exception as e:
+    st.error(f"❌ Error loading data: {str(e)}")
+    st.stop()
+
+# Compact title
+st.markdown("### Cheat Sheet for Enhancer Analysis")
+
+# Sidebar for filters
+st.sidebar.header("🔍 Filters & Selection")
+st.sidebar.markdown("Choose filters to focus your analysis")
+
+# Smart filtering logic - get base data first
+base_enhancers = sorted(hof_enhancers['enhancer_id'].unique()) if hof_enhancers is not None and 'enhancer_id' in hof_enhancers.columns else []
+base_metadata = enhancer_metadata[enhancer_metadata['enhancer_id'].isin(base_enhancers)] if enhancer_metadata is not None and not enhancer_metadata.empty else pd.DataFrame()
+
+# Sort cell types numerically by their leading numbers (1-34)
+import re
 def extract_cell_type_number(cell_type):
-    """Extract numeric value from cell type for sorting"""
-    if pd.isna(cell_type):
-        return float('inf')
-    
-    cell_type_str = str(cell_type)
-    for i, char in enumerate(cell_type_str):
-        if char.isdigit():
-            num_str = ""
-            for j in range(i, len(cell_type_str)):
-                if cell_type_str[j].isdigit():
-                    num_str += cell_type_str[j]
-                else:
-                    break
-            return int(num_str) if num_str else float('inf')
-    return float('inf')
+    match = re.match(r'^(\d+)', str(cell_type))
+    return int(match.group(1)) if match else 999
 
+base_cell_types = sorted(peak_data['cell_type'].unique(), key=extract_cell_type_number) if peak_data is not None and not peak_data.empty else []
+
+# Initialize session state for filters if not exists
+if 'filter_state' not in st.session_state:
+    st.session_state.filter_state = {
+        'enhancer': 'All',
+        'cargo': 'All', 
+        'experiment': 'All',
+        'gene': 'All',
+        'gc_delivered': 'All',
+        'cell_type': 'All'
+    }
+
+# Smart filter function - updates available options based on current selections
 def get_filtered_options(selected_filters, base_metadata):
     """Get available options for each filter based on current selections - cell type remains independent"""
-    if base_metadata is None or base_metadata.empty:
-        return {
-            'enhancers': [],
-            'cargos': [],
-            'experiments': [],
-            'genes': [],
-            'gc_delivered': [],
-            'cell_types': []
-        }
     
+    # For each filter, determine what should be available based on OTHER selected filters
     def get_options_for_filter(exclude_filter):
-        """Get filtered metadata excluding one filter to show available options"""
-        temp_metadata = base_metadata.copy()
+        current_metadata = base_metadata.copy()
         
-        # Apply all filters except the excluded one
+        # Apply all filters EXCEPT the one we're calculating options for
         for filter_name, filter_value in selected_filters.items():
-            if filter_name != exclude_filter and filter_value != "All":
+            if filter_name == exclude_filter or filter_name == 'cell_type':  # Skip cell type and target filter
+                continue
+            if filter_value != 'All':
                 if filter_name == 'enhancer':
-                    temp_metadata = temp_metadata[temp_metadata['enhancer_id'] == filter_value]
+                    current_metadata = current_metadata[current_metadata['enhancer_id'] == filter_value]
                 elif filter_name == 'cargo':
-                    temp_metadata = temp_metadata[temp_metadata['cargo'] == filter_value]
+                    current_metadata = current_metadata[current_metadata['cargo'] == filter_value]
                 elif filter_name == 'experiment':
-                    temp_metadata = temp_metadata[temp_metadata['experiment'] == filter_value]
+                    current_metadata = current_metadata[current_metadata['experiment'] == filter_value]
                 elif filter_name == 'gene':
-                    temp_metadata = temp_metadata[temp_metadata['proximal_gene'] == filter_value]
+                    current_metadata = current_metadata[current_metadata['proximal_gene'] == filter_value]
                 elif filter_name == 'gc_delivered':
-                    temp_metadata = temp_metadata[temp_metadata['GC delivered'] == filter_value]
+                    current_metadata = current_metadata[current_metadata['GC delivered'] == filter_value]
         
-        return temp_metadata
+        return current_metadata
     
+    # Get available options for each filter
     enhancer_metadata = get_options_for_filter('enhancer')
-    available_enhancers = sorted([x for x in enhancer_metadata['enhancer_id'].dropna().unique() if x != '']) if not enhancer_metadata.empty else []
+    available_enhancers = sorted(enhancer_metadata['enhancer_id'].unique()) if not enhancer_metadata.empty else []
     
     cargo_metadata = get_options_for_filter('cargo')
     available_cargos = sorted([x for x in cargo_metadata['cargo'].dropna().unique() if x != '']) if not cargo_metadata.empty else []
@@ -159,65 +100,38 @@ def get_filtered_options(selected_filters, base_metadata):
     gc_metadata = get_options_for_filter('gc_delivered')
     available_gc_delivered = sorted([x for x in gc_metadata['GC delivered'].dropna().unique() if x != '']) if not gc_metadata.empty else []
     
-    # Cell type stays independent - show all available cell types
-    base_cell_types = sorted([f"cell_type_{i}" for i in range(1, 35)], key=lambda x: int(x.split('_')[2]))
+    # Cell type stays independent - always show all cell types
     available_cell_types = base_cell_types
     
     return {
         'enhancers': available_enhancers,
         'cargos': available_cargos,
-        'experiments': available_experiments,
+        'experiments': available_experiments, 
         'genes': available_genes,
         'gc_delivered': available_gc_delivered,
         'cell_types': available_cell_types
     }
 
-# Application header
-st.markdown('<div class="main-header"><h1>🧬 CHEAT SHEET FOR ENHANCER ANALYSIS</h1><p>GitHub → Posit Cloud Deployment</p></div>', unsafe_allow_html=True)
+# Get current filter options
+current_options = get_filtered_options(st.session_state.filter_state, base_metadata)
 
-# Load data
-peak_data, hof_enhancers, enhancer_metadata = load_data()
-
-if peak_data is None:
-    st.stop()
-
-# Initialize visualization generator
-viz_generator = VisualizationGenerator()
-
-# Initialize session state for filters
-if 'filter_state' not in st.session_state:
-    st.session_state.filter_state = {
-        'enhancer': 'All',
-        'cargo': 'All',
-        'experiment': 'All',
-        'gene': 'All',
-        'gc_delivered': 'All',
-        'cell_type': 'All'
-    }
-
-# Get current filter options based on selections
-current_options = get_filtered_options(st.session_state.filter_state, enhancer_metadata)
-
-# Sidebar filters
-st.sidebar.markdown("## 🔍 Filter Options")
-st.sidebar.markdown("*Deployed from GitHub Repository*")
-
+# Sidebar filter controls with smart filtering
 selected_enhancer = st.sidebar.selectbox(
     "Select Enhancer",
     options=["All"] + current_options['enhancers'],
     index=0 if st.session_state.filter_state['enhancer'] == 'All' or st.session_state.filter_state['enhancer'] not in current_options['enhancers'] else current_options['enhancers'].index(st.session_state.filter_state['enhancer']) + 1,
-    help="Choose a specific Hall of Fame enhancer"
+    help="Choose a specific enhancer to analyze"
 )
 
 selected_cargo = st.sidebar.selectbox(
     "Filter by Cargo",
     options=["All"] + current_options['cargos'],
     index=0 if st.session_state.filter_state['cargo'] == 'All' or st.session_state.filter_state['cargo'] not in current_options['cargos'] else current_options['cargos'].index(st.session_state.filter_state['cargo']) + 1,
-    help="Filter by delivered genetic cargo"
+    help="Filter by experimental cargo type"
 )
 
 selected_experiment = st.sidebar.selectbox(
-    "Filter by Experiment",
+    "Filter by Experiment", 
     options=["All"] + current_options['experiments'],
     index=0 if st.session_state.filter_state['experiment'] == 'All' or st.session_state.filter_state['experiment'] not in current_options['experiments'] else current_options['experiments'].index(st.session_state.filter_state['experiment']) + 1,
     help="Filter by experiment identifier"
@@ -241,10 +155,10 @@ selected_cell_type = st.sidebar.selectbox(
     "Filter by Cell Type",
     options=["All"] + current_options['cell_types'],
     index=0 if st.session_state.filter_state['cell_type'] == 'All' or st.session_state.filter_state['cell_type'] not in current_options['cell_types'] else current_options['cell_types'].index(st.session_state.filter_state['cell_type']) + 1,
-    help="Focus on specific cell type for visualization"
+    help="Filter by cell type for accessibility tracks"
 )
 
-# Update session state with new selections
+# Update session state
 st.session_state.filter_state = {
     'enhancer': selected_enhancer,
     'cargo': selected_cargo,
@@ -327,8 +241,8 @@ elif selected_enhancer == "All":
             
             display_data.append({
                 'Enhancer': enhancer_id,
-                'Location': f"{chr_info}:{start_pos:,}-{end_pos:,}",
-                'Length (bp)': f"{length:,}",
+                'Location': f"{chr_info}:{start_pos}-{end_pos}",
+                'Length (bp)': length,
                 'Cargo': cargo,
                 'Experiment': experiment,
                 'Gene': gene,
@@ -336,28 +250,18 @@ elif selected_enhancer == "All":
                 'Experiments': unique_experiments
             })
         
+        # Display as DataFrame
         summary_df = pd.DataFrame(display_data)
         st.dataframe(summary_df, use_container_width=True)
         
-        st.markdown(f"**Total Enhancers: {len(filtered_enhancers)}**")
+        st.markdown(f"**Total enhancers:** {len(filtered_enhancers)}")
         
-        # Show overall statistics
-        if not relevant_metadata.empty:
-            st.markdown("### Summary Statistics")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Unique Cargos", relevant_metadata['cargo'].nunique())
-            with col2:
-                st.metric("Unique Experiments", relevant_metadata['experiment'].nunique())
-            with col3:
-                st.metric("Unique Genes", relevant_metadata['proximal_gene'].nunique())
-
 else:
     # Show detailed view for selected enhancer
-    selected_enhancer_data = filtered_enhancers[filtered_enhancers['enhancer_id'] == selected_enhancer]
+    selected_row = filtered_enhancers[filtered_enhancers['enhancer_id'] == selected_enhancer]
     
-    if not selected_enhancer_data.empty:
-        enhancer_row = selected_enhancer_data.iloc[0]
+    if not selected_row.empty:
+        enhancer_row = selected_row.iloc[0]
         enhancer_id = enhancer_row['enhancer_id']
         chr_info = enhancer_row['chr']
         start_pos = int(enhancer_row['start'])
@@ -373,9 +277,10 @@ else:
             gene = enhancer_meta.iloc[0]['proximal_gene']
             
             # Enhanced header with metadata
-            st.markdown(f'<div class="enhancer-card">', unsafe_allow_html=True)
-            st.markdown(f"# {enhancer_id}")
-            st.markdown(f"**{cargo} • {experiment} • {gene} • {chr_info}:{start_pos:,}-{end_pos:,} ({length:,}bp)**")
+            st.markdown(f'<div style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 10px; margin-bottom: 20px;">', unsafe_allow_html=True)
+            st.markdown(f'<h2 style="color: white; margin: 0; font-size: 24px;">{enhancer_id}</h2>', unsafe_allow_html=True)
+            st.markdown(f'<p style="color: white; margin: 5px 0; font-size: 16px;"><strong>Location:</strong> {chr_info}:{start_pos:,}-{end_pos:,} ({length:,} bp)</p>', unsafe_allow_html=True)
+            st.markdown(f'<p style="color: white; margin: 5px 0; font-size: 16px;"><strong>Cargo:</strong> {cargo} | <strong>Experiment:</strong> {experiment} | <strong>Gene:</strong> {gene}</p>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
             
             # Get all imaging data for this enhancer from the metadata dataframe
@@ -406,100 +311,169 @@ else:
                     # Display imaging if available
                     st.markdown("### 📸 Imaging Data")
                     
-                    # Get imaging URLs with priority logic
-                    image_link = str(meta_row.get('image_link', ''))
-                    neuroglancer_1 = str(meta_row.get('neuroglancer_1', ''))
-                    neuroglancer_3 = str(meta_row.get('neuroglancer_3', ''))
-                    viewer_link = str(meta_row.get('viewer_link', ''))
-                    coronal_mip = str(meta_row.get('coronal_mip', ''))
-                    sagittal_mip = str(meta_row.get('sagittal_mip', ''))
+                    # Get the imaging URLs from the metadata
+                    image_link = meta_row.get('image_link', '')
+                    neuroglancer_1 = meta_row.get('neuroglancer_1', '')
+                    neuroglancer_3 = meta_row.get('neuroglancer_3', '')
+                    viewer_link = meta_row.get('viewer_link', '')
+                    coronal_mip = meta_row.get('coronal_mip', '')
+                    sagittal_mip = meta_row.get('sagittal_mip', '')
                     
-                    # Priority logic based on experiment type
-                    experiment_type = meta_row.get('experiment', '')
+                    # Initialize viewer components
+                    viewer_components = []
+                    contact_sheets = []
                     
-                    if 'lightsheet' in experiment_type.lower():
-                        # Lightsheet: prioritize Neuroglancer and MIP projections
-                        if neuroglancer_1 and neuroglancer_1 != 'nan':
-                            st.markdown("#### Neuroglancer Viewer")
-                            st.markdown(f'<iframe src="{neuroglancer_1}" width="100%" height="600"></iframe>', unsafe_allow_html=True)
+                    # Process image_link (contact sheets)
+                    if image_link and image_link != 'FALSE' and pd.notna(image_link):
+                        if ',' in str(image_link):
+                            contact_sheets.extend([url.strip() for url in str(image_link).split(',')])
+                        else:
+                            contact_sheets.append(str(image_link).strip())
+                    
+                    # Process neuroglancer viewers
+                    if neuroglancer_1 and neuroglancer_1 != 'FALSE' and pd.notna(neuroglancer_1):
+                        if ',' in str(neuroglancer_1):
+                            viewer_components.extend([url.strip() for url in str(neuroglancer_1).split(',')])
+                        else:
+                            viewer_components.append(str(neuroglancer_1).strip())
+                    
+                    if neuroglancer_3 and neuroglancer_3 != 'FALSE' and pd.notna(neuroglancer_3):
+                        if ',' in str(neuroglancer_3):
+                            viewer_components.extend([url.strip() for url in str(neuroglancer_3).split(',')])
+                        else:
+                            viewer_components.append(str(neuroglancer_3).strip())
+                    
+                    # Process viewer_link
+                    if viewer_link and viewer_link != 'FALSE' and pd.notna(viewer_link):
+                        if ',' in str(viewer_link):
+                            viewer_components.extend([url.strip() for url in str(viewer_link).split(',')])
+                        else:
+                            viewer_components.append(str(viewer_link).strip())
+                    
+                    # Process MIP projections
+                    mip_projections = []
+                    if coronal_mip and coronal_mip != 'FALSE' and pd.notna(coronal_mip):
+                        if ',' in str(coronal_mip):
+                            mip_projections.extend([url.strip() for url in str(coronal_mip).split(',')])
+                        else:
+                            mip_projections.append(str(coronal_mip).strip())
+                    
+                    if sagittal_mip and sagittal_mip != 'FALSE' and pd.notna(sagittal_mip):
+                        if ',' in str(sagittal_mip):
+                            mip_projections.extend([url.strip() for url in str(sagittal_mip).split(',')])
+                        else:
+                            mip_projections.append(str(sagittal_mip).strip())
+                    
+                    # Display imaging based on experiment type
+                    experiment_type = meta_row.get('experiment', '').upper()
+                    
+                    if experiment_type == 'LIGHTSHEET':
+                        # For lightsheet: prioritize Neuroglancer viewers and MIP projections
+                        if viewer_components:
+                            st.markdown("#### 🧠 Neuroglancer Viewers")
+                            for i, viewer_url in enumerate(viewer_components):
+                                if viewer_url:
+                                    st.markdown(f"**Viewer {i+1}:**")
+                                    st.components.v1.iframe(viewer_url, height=600)
                         
-                        if coronal_mip and coronal_mip != 'nan' and coronal_mip.lower() != 'false':
-                            st.markdown("#### Coronal MIP Projection")
-                            st.image(coronal_mip, use_column_width=True)
+                        if mip_projections:
+                            st.markdown("#### 📊 MIP Projections")
+                            for i, mip_url in enumerate(mip_projections):
+                                if mip_url:
+                                    st.markdown(f"**MIP Projection {i+1}:**")
+                                    st.image(mip_url, use_column_width=True)
                         
-                        if sagittal_mip and sagittal_mip != 'nan' and sagittal_mip.lower() != 'false':
-                            st.markdown("#### Sagittal MIP Projection")
-                            st.image(sagittal_mip, use_column_width=True)
+                        if contact_sheets:
+                            st.markdown("#### 📷 Contact Sheets")
+                            for i, sheet_url in enumerate(contact_sheets):
+                                if sheet_url:
+                                    st.markdown(f"**Contact Sheet {i+1}:**")
+                                    st.image(sheet_url, use_column_width=True)
+                                    
+                    elif experiment_type == 'EPI':
+                        # For EPI: prioritize contact sheets first, then Neuroglancer
+                        if contact_sheets:
+                            st.markdown("#### 📷 Contact Sheets")
+                            for i, sheet_url in enumerate(contact_sheets):
+                                if sheet_url:
+                                    st.markdown(f"**Contact Sheet {i+1}:**")
+                                    st.image(sheet_url, use_column_width=True)
+                        
+                        if viewer_components:
+                            st.markdown("#### 🧠 Neuroglancer Viewers")
+                            for i, viewer_url in enumerate(viewer_components):
+                                if viewer_url:
+                                    st.markdown(f"**Viewer {i+1}:**")
+                                    st.components.v1.iframe(viewer_url, height=600)
+                        
+                        if mip_projections:
+                            st.markdown("#### 📊 MIP Projections")
+                            for i, mip_url in enumerate(mip_projections):
+                                if mip_url:
+                                    st.markdown(f"**MIP Projection {i+1}:**")
+                                    st.image(mip_url, use_column_width=True)
                     
                     else:
-                        # EPI experiments: prioritize contact sheets
-                        if image_link and image_link != 'nan':
-                            urls = [url.strip() for url in image_link.split(',')]
-                            contact_sheet_urls = [url for url in urls if 'contact_sheet' in url.lower()]
-                            
-                            if contact_sheet_urls:
-                                st.markdown("#### Contact Sheet")
-                                st.markdown(f'<iframe src="{contact_sheet_urls[0]}" width="100%" height="800"></iframe>', unsafe_allow_html=True)
+                        # Default: show all available imaging
+                        if contact_sheets:
+                            st.markdown("#### 📷 Contact Sheets")
+                            for i, sheet_url in enumerate(contact_sheets):
+                                if sheet_url:
+                                    st.markdown(f"**Contact Sheet {i+1}:**")
+                                    st.image(sheet_url, use_column_width=True)
                         
-                        if neuroglancer_1 and neuroglancer_1 != 'nan':
-                            st.markdown("#### Neuroglancer Viewer")
-                            st.markdown(f'<iframe src="{neuroglancer_1}" width="100%" height="600"></iframe>', unsafe_allow_html=True)
+                        if viewer_components:
+                            st.markdown("#### 🧠 Neuroglancer Viewers")
+                            for i, viewer_url in enumerate(viewer_components):
+                                if viewer_url:
+                                    st.markdown(f"**Viewer {i+1}:**")
+                                    st.components.v1.iframe(viewer_url, height=600)
+                        
+                        if mip_projections:
+                            st.markdown("#### 📊 MIP Projections")
+                            for i, mip_url in enumerate(mip_projections):
+                                if mip_url:
+                                    st.markdown(f"**MIP Projection {i+1}:**")
+                                    st.image(mip_url, use_column_width=True)
+                    
+                    # Show message if no imaging data available
+                    if not any([contact_sheets, viewer_components, mip_projections]):
+                        st.info("No imaging data available for this enhancer.")
+                    
+                else:
+                    st.info("No imaging metadata available for this enhancer.")
+        
+        else:
+            st.warning("No metadata available for this enhancer.")
+        
+        # Get peak data for selected enhancer
+        if peak_data is not None and not peak_data.empty:
+            enhancer_peaks = peak_data[peak_data['enhancer_id'] == enhancer_id]
             
-            # Create and display accessibility visualization
-            st.markdown("### 📊 Peak Accessibility Profile")
-            
-            # Get peak data for this enhancer
-            enhancer_peak_data = peak_data[peak_data['enhancer_id'] == enhancer_id]
-            
-            if not enhancer_peak_data.empty:
-                # Create visualization
-                fig = viz_generator.create_peak_visualization(enhancer_peak_data, enhancer_id)
+            if not enhancer_peaks.empty:
+                st.markdown("### 📊 Peak Accessibility Analysis")
                 
                 # Apply cell type filter if specified
                 if selected_cell_type != "All":
-                    # Filter the plot to show only selected cell type
-                    cell_type_data = enhancer_peak_data[enhancer_peak_data['cell_type'] == selected_cell_type]
-                    if not cell_type_data.empty:
-                        fig = viz_generator.create_peak_visualization(cell_type_data, enhancer_id)
-                        st.markdown(f"**Showing accessibility for {selected_cell_type} only**")
+                    enhancer_peaks = enhancer_peaks[enhancer_peaks['cell_type'] == selected_cell_type]
                 
-                st.markdown('<div class="accessibility-plot">', unsafe_allow_html=True)
-                st.plotly_chart(fig, use_container_width=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-                
-                # Show summary statistics
-                st.markdown("### 📈 Summary Statistics")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Cell Types", enhancer_peak_data['cell_type'].nunique())
-                with col2:
-                    st.metric("Peak Positions", len(enhancer_peak_data))
-                with col3:
-                    max_accessibility = enhancer_peak_data.groupby('cell_type')['accessibility'].max().sort_values(ascending=False)
-                    if not max_accessibility.empty:
-                        top_cell_type = max_accessibility.index[0]
-                        st.metric("Top Cell Type", top_cell_type)
-                
-                # Show detailed data table
-                with st.expander("📋 View Raw Data"):
-                    st.dataframe(enhancer_peak_data, use_container_width=True)
+                if not enhancer_peaks.empty:
+                    # Generate visualization
+                    viz_generator = VisualizationGenerator()
                     
-                    # Download button for data
-                    csv = enhancer_peak_data.to_csv(index=False)
-                    st.download_button(
-                        label="Download Data as CSV",
-                        data=csv,
-                        file_name=f"{enhancer_id}_accessibility_data.csv",
-                        mime="text/csv"
-                    )
+                    if selected_cell_type == "All":
+                        # Show all cell types
+                        fig = viz_generator.create_peak_visualization(enhancer_peaks, enhancer_id)
+                    else:
+                        # Show specific cell type
+                        fig = viz_generator.create_cell_type_specific_view(enhancer_peaks, selected_cell_type)
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info(f"No accessibility data available for {selected_cell_type} cell type.")
             else:
-                st.warning("No peak accessibility data available for this enhancer")
+                st.info("No peak accessibility data available for this enhancer.")
         else:
-            st.warning("No metadata available for this enhancer")
+            st.info("Peak data not available.")
     else:
-        st.error("Selected enhancer not found in filtered results")
-
-# Footer
-st.markdown("---")
-st.markdown("**Hall of Fame Enhancers Analysis** | GitHub → Posit Cloud Deployment | Built with Streamlit")
+        st.error("Selected enhancer not found in the data.")
